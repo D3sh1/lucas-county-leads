@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Harris County (Houston, TX) — Motivated Seller Lead Scraper v4
+Harris County (Houston, TX) — Motivated Seller Lead Scraper v5
 ==============================================================
 Public sources (no login required):
-  1. Harris County District Clerk — civil foreclosure / lien filings
-  2. Harris County Tax Office     — delinquent property tax accounts
-  3. Harris County Appraisal (HCAD) — property owner enrichment
+  1. Harris County Tax Sale Listing   — delinquent properties going to auction
+  2. Harris County Clerk Foreclosures — lis pendens / foreclosure notices by month
 
 Distress scoring (max 100 pts):
-  Tax delinquency    +30
-  Foreclosure filing +30
-  Code violation     +25
-  Probate filing     +20
-  Multiple liens     +15
-  Divorce/bankruptcy +10
+  Tax delinquency / sale  +30
+  Foreclosure notice      +30
+  Multiple signals        +15
+  High delinquency amount +10
 """
 
 import json, csv, re, sys, argparse, logging
@@ -45,6 +42,7 @@ SESSION.headers.update({
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.hctax.net/",
 })
 
 def get(url, **kw):
@@ -70,171 +68,216 @@ def post(url, data, **kw):
 def clean(s):
     return " ".join(str(s).split()) if s else ""
 
-# ── 1. Harris County District Clerk — Foreclosure filings ─────────────────
+# ── 1. Harris County Tax Sale Listing ─────────────────────────────────────
 
-CLERK_BASE = "https://www.hcdistrictclerk.com"
-CLERK_SEARCH = "https://www.hcdistrictclerk.com/edocs/public/CaseListFiling.aspx"
+TAX_SALE_URL = "https://www.hctax.net/Property/listings/taxsalelisting"
 
-def scrape_clerk_foreclosures(days_back=7):
-    """Scrape recent foreclosure / lien filings from Harris County District Clerk."""
-    log.info("=== Harris County District Clerk ===")
+def scrape_tax_sale():
+    """Scrape the live Harris County delinquent tax sale property list."""
+    log.info("=== Harris County Tax Sale Listing ===")
+    log.info("URL: %s", TAX_SALE_URL)
 
-    # First load the search page to get ASP.NET tokens
-    r = get(CLERK_SEARCH)
+    r = get(TAX_SALE_URL)
     if not r:
-        log.warning("District Clerk: could not load search page")
-        return _try_clerk_alternate(days_back)
+        log.warning("Tax Sale: no response")
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+    log.info("Tax Sale page title: %s", soup.title.string if soup.title else "n/a")
+
+    # Log a snippet to understand structure
+    log.info("HTML snippet (first 2000 chars):\n%s", r.text[:2000])
+
+    records = []
+
+    # Try standard table
+    tables = soup.find_all("table")
+    log.info("Tax Sale: %d table(s) found", len(tables))
+
+    for table in tables:
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        headers = [clean(c.get_text()) for c in rows[0].find_all(["th", "td"])]
+        log.info("Table headers: %s", headers)
+
+        for row in rows[1:]:
+            cells = [clean(td.get_text()) for td in row.find_all("td")]
+            if len(cells) < 2:
+                continue
+
+            # Try to map by header position
+            def cell(idx, fallback=""):
+                return cells[idx] if len(cells) > idx else fallback
+
+            # Headers order from agent research:
+            # Precinct | Minimum Bid | Adjudged Value | Address | Zip Code
+            # But also: Account #, Cause #, Judgment Date, Tax Years, Status, Sale Type
+            rec = {
+                "source":          "Harris Co. Tax Sale",
+                "doc_type":        "TAX_DELINQUENT",
+                "case_number":     "",
+                "owner":           "",
+                "address":         "",
+                "zip":             "",
+                "filing_date":     "",
+                "adjudged_value":  "",
+                "minimum_bid":     "",
+                "tax_years":       "",
+                "sale_status":     "",
+                "score":           0,
+                "signals":         ["tax_delinquency"],
+            }
+
+            # Map cells to known fields based on header names
+            for i, h in enumerate(headers):
+                h_low = h.lower()
+                v = cell(i)
+                if "address" in h_low:
+                    rec["address"] = v
+                elif "zip" in h_low:
+                    rec["zip"] = v
+                elif "account" in h_low:
+                    rec["case_number"] = v
+                elif "cause" in h_low:
+                    rec["case_number"] = rec["case_number"] or v
+                elif "adjudged" in h_low:
+                    rec["adjudged_value"] = v
+                elif "minimum" in h_low or "bid" in h_low:
+                    rec["minimum_bid"] = v
+                elif "judgment" in h_low and "date" in h_low:
+                    rec["filing_date"] = v
+                elif "tax year" in h_low or "year" in h_low:
+                    rec["tax_years"] = v
+                elif "status" in h_low:
+                    rec["sale_status"] = v
+                elif "owner" in h_low or "name" in h_low:
+                    rec["owner"] = v
+
+            # If headers didn't map, fall back to positional
+            if not rec["address"] and len(cells) >= 4:
+                rec["address"] = cell(3)
+            if not rec["minimum_bid"] and len(cells) >= 2:
+                rec["minimum_bid"] = cell(1)
+
+            # Add bonus signal if high value
+            try:
+                bid = float(re.sub(r"[^\d.]", "", rec.get("minimum_bid", "") or "0"))
+                if bid > 50000:
+                    rec["signals"].append("high_value")
+            except Exception:
+                pass
+
+            if rec["address"] or rec["case_number"]:
+                records.append(rec)
+
+    # If no tables, try JSON embedded in page
+    if not records:
+        log.info("No table rows — checking for embedded JSON...")
+        json_matches = re.findall(r'\[(\{.*?"address".*?\}.*?)\]', r.text, re.DOTALL | re.IGNORECASE)
+        for m in json_matches[:3]:
+            log.info("Possible JSON fragment: %s", m[:300])
+
+    log.info("Tax Sale → %d record(s)", len(records))
+    return records
+
+# ── 2. Harris County Clerk — Foreclosure Notices ───────────────────────────
+
+FRCL_URL = "https://www.cclerk.hctx.net/Applications/WebSearch/FRCL_R.aspx"
+
+def scrape_clerk_foreclosures():
+    """Scrape recent foreclosure postings from Harris County Clerk."""
+    log.info("=== Harris County Clerk Foreclosures ===")
+    log.info("URL: %s", FRCL_URL)
+
+    r = get(FRCL_URL)
+    if not r:
+        log.warning("Foreclosure Clerk: no response")
+        return []
 
     soup = BeautifulSoup(r.text, "lxml")
     log.info("Clerk page title: %s", soup.title.string if soup.title else "n/a")
-    log.debug("Clerk HTML[:1500]: %s", r.text[:1500])
+    log.info("HTML snippet (first 2000 chars):\n%s", r.text[:2000])
 
-    # Grab ASP.NET hidden fields
     vs  = soup.find("input", {"id": "__VIEWSTATE"})
     ev  = soup.find("input", {"id": "__EVENTVALIDATION"})
     vsg = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})
 
-    date_from = (datetime.now() - timedelta(days=days_back)).strftime("%m/%d/%Y")
-    date_to   = datetime.now().strftime("%m/%d/%Y")
+    now = datetime.now()
+    year  = str(now.year)
+    month = f"{now.month:02d}"
 
+    # Search options found: Year dropdown + Month dropdown
     payload = {
         "__VIEWSTATE":            vs["value"]  if vs  else "",
         "__EVENTVALIDATION":      ev["value"]  if ev  else "",
         "__VIEWSTATEGENERATOR":   vsg["value"] if vsg else "",
-        "ctl00$ctl00$cphMain$cphMain$txtFilingDateFrom": date_from,
-        "ctl00$ctl00$cphMain$cphMain$txtFilingDateTo":   date_to,
-        "ctl00$ctl00$cphMain$cphMain$ddCaseType":        "T",   # Tax / Foreclosure
-        "ctl00$ctl00$cphMain$cphMain$btnSearch":         "Search",
+        "ctl00$ctl00$cphMain$cphMain$ddlYear":  year,
+        "ctl00$ctl00$cphMain$cphMain$ddlMonth": month,
+        "ctl00$ctl00$cphMain$cphMain$btnSearch": "Search",
     }
 
-    r2 = post(CLERK_SEARCH, payload)
+    # Also try with simpler field names
+    payload_alt = {
+        "__VIEWSTATE":       vs["value"]  if vs  else "",
+        "__EVENTVALIDATION": ev["value"]  if ev  else "",
+        "ddlYear":           year,
+        "ddlMonth":          month,
+        "btnSearch":         "Search",
+    }
+
+    log.info("Posting foreclosure search for %s/%s...", month, year)
+    r2 = post(FRCL_URL, payload)
     if not r2:
-        return _try_clerk_alternate(days_back)
-
-    return _parse_clerk_results(r2.text, "Foreclosure")
-
-def _try_clerk_alternate(days_back):
-    """Fallback: try the newer Harris County portal."""
-    log.info("Trying alternate clerk URL...")
-    url = "https://www.hcdistrictclerk.com/edocs/public/search.aspx"
-    r = get(url)
-    if r:
-        return _parse_clerk_results(r.text, "Clerk Filing")
-    return []
-
-def _parse_clerk_results(html, doc_type):
-    soup = BeautifulSoup(html, "lxml")
-    records = []
-    tables = soup.find_all("table")
-    log.info("Clerk results: %d table(s) found", len(tables))
-
-    for table in tables:
-        rows = table.find_all("tr")
-        headers = [clean(th.get_text()) for th in rows[0].find_all(["th","td"])] if rows else []
-        log.debug("Table headers: %s", headers)
-
-        for row in rows[1:]:
-            cells = [clean(td.get_text()) for td in row.find_all("td")]
-            if len(cells) < 2:
-                continue
-            rec = {
-                "source":       "Harris Co. District Clerk",
-                "doc_type":     doc_type,
-                "case_number":  cells[0] if cells else "",
-                "owner":        cells[1] if len(cells) > 1 else "",
-                "address":      cells[2] if len(cells) > 2 else "",
-                "filing_date":  cells[3] if len(cells) > 3 else "",
-                "score":        0,
-                "signals":      ["foreclosure"],
-            }
-            if rec["case_number"] or rec["owner"]:
-                records.append(rec)
-
-    log.info("District Clerk → %d record(s)", len(records))
-    return records
-
-# ── 2. Harris County Tax Office — Delinquent accounts ─────────────────────
-
-TAX_URL = "https://www.hctax.net/Property/PropertyTax"
-
-def scrape_tax_delinquent():
-    """Scrape delinquent tax accounts from Harris County Tax Office."""
-    log.info("=== Harris County Tax Office ===")
-    r = get(TAX_URL)
-    if not r:
-        log.warning("Tax Office: no response")
+        r2 = post(FRCL_URL, payload_alt)
+    if not r2:
         return []
 
-    soup = BeautifulSoup(r.text, "lxml")
-    log.info("Tax page title: %s", soup.title.string if soup.title else "n/a")
-    log.debug("Tax HTML[:1500]: %s", r.text[:1500])
+    soup2 = BeautifulSoup(r2.text, "lxml")
+    log.info("Foreclosure results HTML[:1500]: %s", r2.text[:1500])
 
     records = []
-    tables = soup.find_all("table")
-    log.info("Tax Office: %d table(s) found", len(tables))
+    tables = soup2.find_all("table")
+    log.info("Clerk foreclosures: %d table(s) found", len(tables))
 
     for table in tables:
         rows = table.find_all("tr")
+        headers = [clean(c.get_text()) for c in rows[0].find_all(["th","td"])] if rows else []
+        log.info("Foreclosure table headers: %s", headers)
+
         for row in rows[1:]:
             cells = [clean(td.get_text()) for td in row.find_all("td")]
             if len(cells) < 2:
                 continue
+
             rec = {
-                "source":      "Harris Co. Tax Office",
-                "doc_type":    "TAX_DELINQUENT",
+                "source":      "Harris Co. Clerk Foreclosures",
+                "doc_type":    "FORECLOSURE",
                 "case_number": cells[0] if cells else "",
                 "owner":       cells[1] if len(cells) > 1 else "",
                 "address":     cells[2] if len(cells) > 2 else "",
                 "filing_date": cells[3] if len(cells) > 3 else "",
                 "score":       0,
-                "signals":     ["tax_delinquency"],
+                "signals":     ["foreclosure"],
             }
-            if rec["owner"] or rec["address"]:
+
+            # Map by headers if available
+            for i, h in enumerate(headers):
+                h_low = h.lower()
+                v = cells[i] if i < len(cells) else ""
+                if "address" in h_low:
+                    rec["address"] = v
+                elif "grantor" in h_low or "owner" in h_low or "name" in h_low:
+                    rec["owner"] = v
+                elif "file" in h_low and "date" in h_low:
+                    rec["filing_date"] = v
+                elif "doc" in h_low and "id" in h_low or "number" in h_low:
+                    rec["case_number"] = v
+
+            if rec["case_number"] or rec["owner"] or rec["address"]:
                 records.append(rec)
 
-    log.info("Tax Office → %d record(s)", len(records))
-    return records
-
-# ── 3. HCAD Property Search — Recent deed activity ─────────────────────────
-
-HCAD_URL = "https://hcad.org/property-search/real-property/"
-
-def scrape_hcad():
-    """Scrape HCAD for recent property transfers / distressed indicators."""
-    log.info("=== HCAD Property Search ===")
-    r = get(HCAD_URL)
-    if not r:
-        log.warning("HCAD: no response")
-        return []
-
-    soup = BeautifulSoup(r.text, "lxml")
-    log.info("HCAD page title: %s", soup.title.string if soup.title else "n/a")
-    log.debug("HCAD HTML[:1500]: %s", r.text[:1500])
-
-    records = []
-    tables = soup.find_all("table")
-    log.info("HCAD: %d table(s) found", len(tables))
-
-    for table in tables:
-        rows = table.find_all("tr")
-        for row in rows[1:]:
-            cells = [clean(td.get_text()) for td in row.find_all("td")]
-            if len(cells) < 2:
-                continue
-            rec = {
-                "source":      "HCAD",
-                "doc_type":    "PROPERTY",
-                "case_number": cells[0] if cells else "",
-                "owner":       cells[1] if len(cells) > 1 else "",
-                "address":     cells[2] if len(cells) > 2 else "",
-                "filing_date": "",
-                "score":       0,
-                "signals":     [],
-            }
-            if rec["owner"] or rec["address"]:
-                records.append(rec)
-
-    log.info("HCAD → %d record(s)", len(records))
+    log.info("Clerk Foreclosures → %d record(s)", len(records))
     return records
 
 # ── Scoring ────────────────────────────────────────────────────────────────
@@ -242,10 +285,8 @@ def scrape_hcad():
 WEIGHTS = {
     "tax_delinquency": 30,
     "foreclosure":     30,
-    "code_violation":  25,
-    "probate":         20,
+    "high_value":      10,
     "multiple_liens":  15,
-    "divorce":         10,
 }
 
 def score_lead(rec):
@@ -259,7 +300,7 @@ def write_json(records):
     path = DATA / "output.json"
     payload = {
         "fetched_at": datetime.utcnow().isoformat() + "Z",
-        "source": "Harris County District Clerk / Tax Office / HCAD",
+        "source": "Harris County Tax Sale / Clerk Foreclosures",
         "total": len(records),
         "records": records,
     }
@@ -268,8 +309,9 @@ def write_json(records):
 
 def write_ghl_csv(records):
     path = DATA / "ghl_export.csv"
-    fields = ["owner", "address", "source", "doc_type",
-              "filing_date", "case_number", "score", "signals"]
+    fields = ["owner", "address", "zip", "source", "doc_type",
+              "filing_date", "case_number", "adjudged_value",
+              "minimum_bid", "tax_years", "sale_status", "score", "signals"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -287,15 +329,17 @@ def write_dashboard(records):
         sig   = ", ".join(r.get("signals", []))
         score = r.get("score", 0)
         color = "#c0392b" if score >= 50 else "#e67e22" if score >= 25 else "#27ae60"
+        bid   = r.get("minimum_bid", "") or r.get("adjudged_value", "")
         rows += (
             f"<tr>"
             f"<td style='color:{color};font-weight:bold'>{score}</td>"
             f"<td>{r.get('owner','')}</td>"
-            f"<td>{r.get('address','')}</td>"
+            f"<td>{r.get('address','')} {r.get('zip','')}</td>"
             f"<td>{r.get('source','')}</td>"
             f"<td>{r.get('doc_type','')}</td>"
             f"<td>{r.get('filing_date','')}</td>"
             f"<td>{r.get('case_number','')}</td>"
+            f"<td>{bid}</td>"
             f"<td>{sig}</td>"
             f"</tr>\n"
         )
@@ -311,7 +355,7 @@ def write_dashboard(records):
   h1{{color:#2c3e50}}
   .meta{{color:#666;margin-bottom:16px}}
   table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.15)}}
-  th{{background:#2c3e50;color:#fff;padding:10px 12px;text-align:left;cursor:pointer}}
+  th{{background:#2c3e50;color:#fff;padding:10px 12px;text-align:left;cursor:pointer;white-space:nowrap}}
   td{{padding:9px 12px;border-bottom:1px solid #eee;font-size:.9em}}
   tr:hover td{{background:#f0f8ff}}
 </style>
@@ -329,11 +373,12 @@ def write_dashboard(records):
   <th onclick="sortTable(4)">Type</th>
   <th onclick="sortTable(5)">Date</th>
   <th onclick="sortTable(6)">Case #</th>
-  <th onclick="sortTable(7)">Signals</th>
+  <th onclick="sortTable(7)">Bid / Value</th>
+  <th onclick="sortTable(8)">Signals</th>
 </tr>
 </thead>
 <tbody>
-{rows if rows else '<tr><td colspan="8" style="text-align:center;padding:30px;color:#999">No leads found — check Actions logs</td></tr>'}
+{rows if rows else '<tr><td colspan="9" style="text-align:center;padding:30px;color:#999">No leads found — check Actions logs</td></tr>'}
 </tbody>
 </table>
 <script>
@@ -364,13 +409,12 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    log.info("=== Harris County Scraper v4 starting ===")
+    log.info("=== Harris County Scraper v5 starting ===")
     log.info("Days back: %d | Limit: %d", args.days, args.limit)
 
     all_records = []
-    all_records += scrape_clerk_foreclosures(days_back=args.days)
-    all_records += scrape_tax_delinquent()
-    all_records += scrape_hcad()
+    all_records += scrape_tax_sale()
+    all_records += scrape_clerk_foreclosures()
 
     for r in all_records:
         score_lead(r)
