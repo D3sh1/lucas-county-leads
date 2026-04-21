@@ -1,1 +1,1 @@
-owner,address,source,doc_type,filing_date,case_number,score,signals
+owner,address,zip,source,doc_type,filing_date,case_number,adjudged_value,minimum_bid,tax_years,sale_status,score,signals
